@@ -1,131 +1,101 @@
 package com.example.test.demo;
 
-import com.amazonaws.auth.AWSStaticCredentialsProvider;
-import com.amazonaws.auth.BasicAWSCredentials;
-import com.amazonaws.regions.Regions;
-import com.amazonaws.services.apigateway.AmazonApiGateway;
-import com.amazonaws.services.apigateway.AmazonApiGatewayClientBuilder;
-import com.amazonaws.services.apigateway.model.*;
-import com.amazonaws.services.sqs.AmazonSQS;
-import com.amazonaws.services.sqs.AmazonSQSClientBuilder;
-import com.amazonaws.services.sqs.model.*;
-
-import java.util.List;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.CreateQueueRequest;
+import software.amazon.awssdk.services.sqs.model.QueueAttributeName;
+import software.amazon.awssdk.services.apigateway.ApiGatewayClient;
+import software.amazon.awssdk.services.apigateway.model.CreateRestApiRequest;
+import software.amazon.awssdk.services.apigateway.model.CreateRestApiResponse;
+import software.amazon.awssdk.services.lambda.LambdaClient;
+import software.amazon.awssdk.services.lambda.model.AddPermissionRequest;
+import java.util.HashMap;
+import java.util.Map;
 
 public class App {
-
     private static final String AWS_ACCESS_KEY = "YOUR_ACCESS_KEY";
     private static final String AWS_SECRET_KEY = "YOUR_SECRET_KEY";
-    private static final Regions REGION = Regions.US_EAST_1;
+    private static final Region REGION = Region.US_EAST_1;
 
-    private final AmazonSQS sqsClient;
-    private final AmazonApiGateway apiGatewayClient;
+    private final SqsClient sqsClient;
+    private final ApiGatewayClient apiGatewayClient;
+    private final LambdaClient lambdaClient;
 
     public App() {
-        BasicAWSCredentials credentials = new BasicAWSCredentials(AWS_ACCESS_KEY, AWS_SECRET_KEY);
-        this.sqsClient = AmazonSQSClientBuilder.standard()
-                .withCredentials(new AWSStaticCredentialsProvider(credentials))
-                .withRegion(REGION)
-                .build();
-        this.apiGatewayClient = AmazonApiGatewayClientBuilder.standard()
-                .withCredentials(new AWSStaticCredentialsProvider(credentials))
-                .withRegion(REGION)
-                .build();
+        AwsBasicCredentials credentials = AwsBasicCredentials.create(AWS_ACCESS_KEY, AWS_SECRET_KEY);
+        this.sqsClient = SqsClient.builder()
+                                  .credentialsProvider(StaticCredentialsProvider.create(credentials))
+                                  .region(REGION)
+                                  .build();
+        this.apiGatewayClient = ApiGatewayClient.builder()
+                                                .credentialsProvider(StaticCredentialsProvider.create(credentials))
+                                                .region(REGION)
+                                                .build();
+        this.lambdaClient = LambdaClient.builder()
+                                        .credentialsProvider(StaticCredentialsProvider.create(credentials))
+                                        .region(REGION)
+                                        .build();
     }
 
-    public String createSQSQueue(String queueName) {
-        CreateQueueRequest createQueueRequest = new CreateQueueRequest(queueName + ".fifo")
-                .addAttributesEntry(QueueAttributeName.FifoQueue.toString(), "true");
-        CreateQueueResult createQueueResult = sqsClient.createQueue(createQueueRequest);
-        return createQueueResult.getQueueUrl();
+    public String createSQSQueue(String queueName, String lambdaArn) {
+        Map<QueueAttributeName, String> attributes = new HashMap<>();
+        attributes.put(QueueAttributeName.FIFO_QUEUE, "true");
+        CreateQueueRequest createQueueRequest = CreateQueueRequest.builder()
+                                                                 .queueName(queueName + ".fifo")
+                                                                 .attributes(attributes)
+                                                                 .build();
+        String queueUrl = sqsClient.createQueue(createQueueRequest).queueUrl();
+
+        // Permission for Lambda to poll the SQS queue
+        //String policy = "{\"Version\":\"2012-10-17\",\"Id\":\"" + queueUrl + "/SQSDefaultPolicy\",\"Statement\":[{\"Sid\":\"AllowLambdaInvoke\",\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"SQS:SendMessage\",\"Resource\":\"" + queueUrl + "\",\"Condition\":{\"ArnEquals\":{\"aws:SourceArn\":\"" + lambdaArn + "\"}}}]}";
+        sqsClient.tagQueue(builder -> builder.queueUrl(queueUrl).tags(Map.of("lambdaTrigger", "enabled")));
+
+        //adding permission requests to lambda for invoking from a SQS queue
+        AddPermissionRequest addPermissionRequest = AddPermissionRequest.builder()
+                                                                        .functionName(lambdaArn)
+                                                                        .statementId("AllowExecutionFromSQS")
+                                                                        .action("lambda:InvokeFunction")
+                                                                        .principal("sqs.amazonaws.com")
+                                                                        .sourceArn(queueUrl)
+                                                                        .build();
+        lambdaClient.addPermission(addPermissionRequest);
+
+        return queueUrl;
     }
 
     public String createApiGateway(String apiName) {
-        CreateRestApiRequest createRestApiRequest = new CreateRestApiRequest()
-                .withName(apiName);
-        CreateRestApiResult createRestApiResponse = apiGatewayClient.createRestApi(createRestApiRequest);
-        return createRestApiResponse.getId();
+        CreateRestApiRequest createRestApiRequest = CreateRestApiRequest.builder()
+                                                                       .name(apiName)
+                                                                       .build();
+        CreateRestApiResponse response = apiGatewayClient.createRestApi(createRestApiRequest);
+        return response.id();
     }
 
-    public void attachSQSToApiGateway(String apiId, String queueUrl) {
-        PutIntegrationRequest putIntegrationRequest = new PutIntegrationRequest()
-                .withRestApiId(apiId)
-                .withResourceId("root")
-                .withHttpMethod("POST")
-                .withType(IntegrationType.AWS)
-                .withIntegrationHttpMethod("POST")
-                .withUri("arn:aws:apigateway:" + REGION.getName() + ":sqs:path/" + queueUrl);
-        apiGatewayClient.putIntegration(putIntegrationRequest);
-
-        apiGatewayClient.putMethodResponse(new PutMethodResponseRequest()
-                .withRestApiId(apiId)
-                .withResourceId("root")
-                .withHttpMethod("POST")
-                .withStatusCode("200"));
-
-        apiGatewayClient.putIntegrationResponse(new PutIntegrationResponseRequest()
-                .withRestApiId(apiId)
-                .withResourceId("root")
-                .withHttpMethod("POST")
-                .withStatusCode("200")
-                .withResponseParameters(null));
+    public void attachSQSToApiGateway(String apiId, String queueName) {
+        String integrationUri = String.format("arn:aws:apigateway:%s:sqs:path/%s/%s", REGION.id(), "ACCOUNT_ID", queueName);
+        apiGatewayClient.putIntegration(builder -> builder.restApiId(apiId)
+                                                             .httpMethod("POST")
+                                                             .type("AWS")
+                                                             .integrationHttpMethod("POST")
+                                                             .uri(integrationUri));
+        System.out.println("API Gateway Integrated with SQS at: " + integrationUri);
     }
 
-    public void scriptRun(String queueName, String apiGatewayName) {
-        // Create SQS Queue
-        String queueUrl = this.createSQSQueue(queueName);
+    public void setupInfrastructure(String queueName, String apiName, String lambdaArn) {
+        String queueUrl = createSQSQueue(queueName, lambdaArn);
+        String apiId = createApiGateway(apiName);
+        attachSQSToApiGateway(apiId, queueUrl);
 
-        // Add relevant access policy to the queue
-        this.addSQSQueuePolicy(queueUrl);
-
-        // Generate API Gateway with given name
-        String apiId = this.createApiGateway(apiGatewayName);
-
-        // Attach SQS to the API Gateway
-        this.attachSQSToApiGateway(apiId, queueUrl);
-
-        // Print relevant URL
-        System.out.println("API Gateway URL for " + apiGatewayName + ":");
-        System.out.println("https://" + apiId + ".execute-api." + REGION.getName() + ".amazonaws.com/default");
-        System.out.println();
-    }
-
-    public void addSQSQueuePolicy(String queueUrl) {
-        String queueArn = sqsClient.getQueueAttributes(queueUrl, List.of("QueueArn")).getAttributes().get("QueueArn");
-
-        String policy = "{\n" +
-                "  \"Version\": \"2012-10-17\",\n" +
-                "  \"Statement\": [{\n" +
-                "    \"Effect\": \"Allow\",\n" +
-                "    \"Principal\": \"*\",\n" +
-                "    \"Action\": \"SQS:SendMessage\",\n" +
-                "    \"Resource\": \"" + queueArn + "\",\n" +
-                "    \"Condition\": {\n" +
-                "      \"ArnEquals\": {\n" +
-                "        \"aws:SourceArn\": \"arn:aws:execute-api:" + REGION.getName() + ":*:*\"\n" +
-                "      }\n" +
-                "    }\n" +
-                "  }]\n" +
-                "}";
-
-        sqsClient.setQueueAttributes(new SetQueueAttributesRequest()
-                .withQueueUrl(queueUrl)
-                .addAttributesEntry(QueueAttributeName.Policy.toString(), policy));
+        System.out.println("Setup completed. API Gateway ID: " + apiId);
     }
 
     public static void main(String[] args) {
-        App manager = new App();
+        App app = new App();
 
-        // Input list of queue names and API Gateway names
-        List<String> queueApiPairs = List.of("FIFO_SQS_QUEUE_NAME1", "API_GATEWAY_NAME1",
-                                              "FIFO_SQS_QUEUE_NAME2", "API_GATEWAY_NAME2");
+        //pass in the details here
 
-        // Process each pair
-        for (int i = 0; i < queueApiPairs.size(); i += 2) {
-            String queueName = queueApiPairs.get(i);
-            String apiName = queueApiPairs.get(i + 1);
-                
-            manager.scriptRun(queueName, apiName);
-        }
+        app.setupInfrastructure("FIFO_SQS_QUEUE_NAME", "API_GATEWAY_NAME", "LAMBDA_ARN");
     }
 }
